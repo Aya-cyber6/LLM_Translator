@@ -1,0 +1,50 @@
+﻿# 🔥 LLM / model files
+# Models
+*.litertlm
+*.gguf
+*.bin
+*.pt
+*.onnx
+*.tflite
+
+
+# APKs
+*.apk
+
+# JARs
+*.jar
+
+# Whisper / AI models
+models/
+app/src/main/assets/*.litertlm
+app/src/main/assets/*.gguf
+app/src/main/assets/
+# Android build
+.gradle/
+build/
+*/build/
+local.properties
+.cxx/
+
+# Android Studio
+.idea/
+*.iml
+*.kotlin/
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# NDK / CMake
+.externalNativeBuild/
+.cmake/
+
+# Temporary
+*.tmp
+*.cache
+
+# Python (if used)
+__pycache__/
+*.pyc
