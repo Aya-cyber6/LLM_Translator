@@ -23,12 +23,12 @@ import com.translator.ui.viewmodel.TranslationViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
+import com.translator.audio.WhisperModelLoader
 
 class MainActivity : ComponentActivity() {
 
     private val textViewModel: TranslationViewModel by viewModels()
     private val audioViewModel: AudioTranslationViewModel by viewModels()
-
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { /* UI disables mic button automatically if denied */ }
@@ -36,7 +36,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        initModel()
+        initModels()
 
         setContent {
                 TranslatorApp(
@@ -50,7 +50,7 @@ class MainActivity : ComponentActivity() {
     // Copy model asset once, init engine, share with audio VM
     // -------------------------------------------------------------------------
 
-    private fun initModel() {
+    private fun initModels() {
         lifecycleScope.launch(Dispatchers.IO) {
             val modelFile = File(filesDir, "Gemma3-1B-IT_multi-prefill-seq_q4_ekv4096.litertlm")
             if (!modelFile.exists()) {
@@ -58,14 +58,19 @@ class MainActivity : ComponentActivity() {
                     modelFile.outputStream().use { output -> input.copyTo(output) }
                 }
             }
-            // Text VM initialises and owns the engine
             textViewModel.initializeEngine(modelFile.absolutePath)
 
-            // Once the engine is ready, hand it to the audio VM so we don't
-            // load the model weights twice
             textViewModel.waitForEngine { engine ->
                 audioViewModel.attachEngine(engine)
             }
+            // 2️⃣ Initialize Whisper model
+            val whisperModelPath = WhisperModelLoader.ensureModel(
+                context = this@MainActivity,
+                assetFileName = "ggml-tiny.bin"
+            )
+
+            // Load Whisper model in the AudioTranslationViewModel
+            audioViewModel.loadWhisperModel(whisperModelPath)
         }
     }
 }

@@ -1,61 +1,49 @@
-// AudioTranslationUiState.kt
-// State for the audio-translation screen, extended with Whisper model-loading
-// fields required by the new realtime pipeline.
-
 package com.translator.ui.state
 
 data class AudioTranslationUiState(
-    // --- Language pair ---
-    val sourceLanguage: Language = LanguageRepository.defaultSource,
-    val targetLanguage: Language = LanguageRepository.defaultTarget,
+    val asrState: AsrState = AsrState(),
+    val llmState: LlmState = LlmState(),
+    val ttsState: TtsState = TtsState(),
 
-    // --- Engine (LiteRT-LM) ---
-    val isEngineReady: Boolean  = false,
-    val engineError: String?    = null,
-
-    // --- Whisper model ---
-    val isWhisperReady: Boolean   = false,
-    val isWhisperLoading: Boolean = false,
-    val whisperError: String?     = null,
-
-    // --- TTS ---
-    val isTtsReady: Boolean = false,
-
-    // --- Recording ---
     val recordingState: RecordingState = RecordingState.IDLE,
-    val recordingError: String?        = null,
+    val playbackState: PlaybackState = PlaybackState.IDLE,
 
-    // --- Transcript / translation output ---
-    val sourceTranscript: String   = "",
-    val translatedText: String     = "",
-    val transcriptionError: String? = null,
-    val translationError: String?   = null,
-
-    // --- Playback ---
-    val playbackState: PlaybackState = PlaybackState.IDLE
+    val sourceLanguage: Language = Language.defaultSource,
+    val targetLanguage: Language = Language.defaultTarget
 ) {
-    /** True when the user may press the record button. */
     val canRecord: Boolean
-        get() = isEngineReady && isWhisperReady && !isBusy
+        get() = asrState.isReady && recordingState == RecordingState.IDLE
 
-    /** True while audio is being captured. */
     val canStopRecording: Boolean
         get() = recordingState == RecordingState.RECORDING
 
-    /** True when any background work is in progress. */
-    val isBusy: Boolean
-        get() = recordingState != RecordingState.IDLE || playbackState == PlaybackState.PLAYING
+    val showLiveCaption: Boolean
+        get() = recordingState == RecordingState.RECORDING && asrState.liveCaption.isNotBlank()
 
-    /** True when a live partial transcript is being built. */
-    val isTranscribing: Boolean
-        get() = recordingState == RecordingState.RECORDING ||
-                recordingState == RecordingState.PROCESSING
+    val isBusy: Boolean
+        get() = recordingState != RecordingState.IDLE || llmState.isTranslating
 }
 
-// ---------------------------------------------------------------------------
-// Supporting enums
-// ---------------------------------------------------------------------------
+// Grouped sub-states mapping directly to your pipeline:
+data class AsrState(
+    val isReady: Boolean = false,
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    val liveCaption: String = "",
+    val sourceTranscript: String = ""
+)
+
+data class LlmState(
+    val isEngineReady: Boolean = false,
+    val isTranslating: Boolean = false,
+    val error: String? = null,
+    val translatedText: String = ""
+)
+
+data class TtsState(
+    val isReady: Boolean = false,
+    val error: String? = null
+)
 
 enum class RecordingState { IDLE, RECORDING, PROCESSING }
-
-enum class PlaybackState { IDLE, PLAYING }
+enum class PlaybackState  { IDLE, PLAYING }

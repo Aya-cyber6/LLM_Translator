@@ -45,10 +45,18 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
                 val newEngine = Engine(config)
                 newEngine.initialize()
                 engine = newEngine
-                _uiState.update { it.copy(isEngineReady = true, engineError = null) }
-            } catch (e: Exception) {
                 _uiState.update {
-                    it.copy(isEngineReady = false, engineError = "Engine init failed: ${e.message}")
+                    it.copy(llmState = it.llmState.copy(isEngineReady = true, error = null))
+                }
+            } catch (e: Exception) {
+                // FIXED: Target the nested llmState here as well
+                _uiState.update {
+                    it.copy(
+                        llmState = it.llmState.copy(
+                            isEngineReady = false,
+                            error = "Engine init failed: ${e.message}"
+                        )
+                    )
                 }
             }
         }
@@ -59,7 +67,7 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
      * Used by MainActivity to share the engine with AudioTranslationViewModel.
      */
     suspend fun waitForEngine(block: (Engine) -> Unit) {
-        _uiState.first { it.isEngineReady }
+        _uiState.first { it.llmState.isEngineReady }
         engine?.let { block(it) }
     }
 
@@ -68,7 +76,12 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
     // -------------------------------------------------------------------------
 
     fun onSourceTextChange(text: String) {
-        _uiState.update { it.copy(sourceText = text, translationError = null) }
+        _uiState.update {
+            it.copy(
+                sourceText = text,
+                llmState = it.llmState.copy(error = null)
+            )
+        }
     }
 
     fun translate() {
@@ -79,7 +92,13 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
 
         translationJob = viewModelScope.launch {
             _uiState.update {
-                it.copy(isTranslating = true, translatedText = "", translationError = null)
+                it.copy(
+                    llmState = it.llmState.copy(
+                        isTranslating = true,
+                        translatedText = "",
+                        error = null
+                    )
+                )
             }
 
             try {
@@ -104,26 +123,36 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
                             .catch { e ->
                                 _uiState.update {
                                     it.copy(
-                                        isTranslating = false,
-                                        translationError = "Translation failed: ${e.message}"
+                                        llmState = it.llmState.copy(
+                                            isTranslating = false,
+                                            error = "Translation failed: ${e.message}"
+                                        )
                                     )
                                 }
                             }
                             .collect { message ->
                                 _uiState.update { current ->
-                                    current.copy(translatedText = current.translatedText + message.toString())
+                                    current.copy(
+                                        llmState = current.llmState.copy(
+                                            translatedText = current.llmState.translatedText + message.toString()
+                                        )
+                                    )
                                 }
                             }
                     }
                 }
 
-                _uiState.update { it.copy(isTranslating = false) }
+                _uiState.update {
+                    it.copy(llmState = it.llmState.copy(isTranslating = false)) // FIXED
+                }
 
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(
-                        isTranslating = false,
-                        translationError = "Translation failed: ${e.message}"
+                        llmState = it.llmState.copy( // FIXED
+                            isTranslating = false,
+                            error = "Translation failed: ${e.message}"
+                        )
                     )
                 }
             }
@@ -135,23 +164,27 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
         _uiState.update {
             it.copy(
                 sourceText = "",
-                translatedText = "",
-                isTranslating = false,
-                translationError = null
+                llmState = it.llmState.copy(
+                    translatedText = "",
+                    isTranslating = false,
+                    error = null
+                )
             )
         }
     }
 
     fun copyTranslationToSource() {
         val current = _uiState.value
-        if (current.translatedText.isBlank()) return
+        if (current.llmState.translatedText.isBlank()) return
         _uiState.update {
             it.copy(
-                sourceText = current.translatedText,
-                translatedText = "",
+                sourceText = current.llmState.translatedText,
                 sourceLanguage = current.targetLanguage,
                 targetLanguage = current.sourceLanguage,
-                translationError = null
+                llmState = it.llmState.copy(
+                    translatedText = "",
+                    error = null
+                )
             )
         }
     }
@@ -183,8 +216,10 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
             it.copy(
                 sourceLanguage = it.targetLanguage,
                 targetLanguage = it.sourceLanguage,
-                sourceText = it.translatedText,
-                translatedText = it.sourceText
+                sourceText = it.llmState.translatedText,
+                llmState = it.llmState.copy(
+                    translatedText = it.sourceText
+                )
             )
         }
     }

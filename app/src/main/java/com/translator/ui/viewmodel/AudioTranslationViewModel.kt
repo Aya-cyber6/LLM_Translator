@@ -1,3 +1,4 @@
+// AudioTranslationViewModel.kt
 package com.translator.ui.viewmodel
 
 import android.Manifest
@@ -6,17 +7,29 @@ import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.google.ai.edge.litertlm.*
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.ConversationConfig
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.SamplerConfig
+import com.translator.audio.StreamingTranscriber
+import com.translator.audio.TranscriptionSegment
 import com.translator.audio.TtsPlayer
-import com.translator.ui.state.*
+import com.translator.ui.state.AudioTranslationUiState
+import com.translator.ui.state.Language
+import com.translator.ui.state.PlaybackState
+import com.translator.ui.state.RecordingState
 import com.whispercpp.whisper.WhisperContext
-import com.whispercppdemo.recorder.Recorder
-import com.whispercppdemo.media.decodeWaveFile
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 
 class AudioTranslationViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -33,35 +46,58 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
     private var engine: Engine? = null
     private var whisperContext: WhisperContext? = null
-
-    private val recorder = Recorder()
     private val ttsPlayer = TtsPlayer(application)
 
-    private var audioFile: File? = null
+    // -------------------------------------------------------------------------
+    // Concurrent pipeline handles
+    // -------------------------------------------------------------------------
+
+    private var transcriptionJob: Job? = null
+    private var translationJob: Job? = null
+
+    /**
+     * Committed Whisper segments are sent here; the translation job drains it.
+     * UNLIMITED capacity so Whisper commits never block waiting for the LLM.
+     * Closed by stopRecording() to signal the translation job to finish.
+     */
+    private var translationQueue: Channel<String> = Channel(Channel.UNLIMITED)
 
     // -------------------------------------------------------------------------
-    // Engine / model init
+    // Init
     // -------------------------------------------------------------------------
 
     fun attachEngine(sharedEngine: Engine) {
         engine = sharedEngine
-        _uiState.update { it.copy(isEngineReady = true, engineError = null) }
+        _uiState.update {
+            it.copy(llmState = it.llmState.copy(isEngineReady = true, error = null))
+        }
     }
 
     fun loadWhisperModel(modelPath: String) {
         viewModelScope.launch {
-            _uiState.update { it.copy(isWhisperLoading = true, whisperError = null) }
+            _uiState.update { state ->
+                state.copy(
+                    asrState = state.asrState.copy(
+                        isLoading = true,
+                        error = null
+                    )
+                )
+            }
             try {
                 val ctx = withContext(Dispatchers.IO) {
                     WhisperContext.createContextFromFile(modelPath)
                 }
                 whisperContext = ctx
-                _uiState.update { it.copy(isWhisperReady = true, isWhisperLoading = false) }
+                _uiState.update {
+                    it.copy(asrState = it.asrState.copy(isReady = true, isLoading = false))
+                }
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(
-                        isWhisperLoading = false,
-                        whisperError = "Failed to load Whisper model: ${e.message}"
+                        asrState = it.asrState.copy(
+                            isLoading = false,
+                            error     = "Failed to load Whisper model: ${e.message}"
+                        )
                     )
                 }
             }
@@ -70,7 +106,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
     fun initTts() {
         ttsPlayer.init { ready ->
-            _uiState.update { it.copy(isTtsReady = ready) }
+            _uiState.update { it.copy(ttsState = it.ttsState.copy(isReady = ready)) }
         }
     }
 
@@ -80,145 +116,188 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
     fun startRecording() {
         if (!_uiState.value.canRecord) return
-
         if (ContextCompat.checkSelfPermission(
-                getApplication(),
-                Manifest.permission.RECORD_AUDIO
+                getApplication(), Manifest.permission.RECORD_AUDIO
             ) != PackageManager.PERMISSION_GRANTED
         ) {
-            _uiState.update { it.copy(recordingError = "Microphone permission not granted.") }
+            _uiState.update {
+                it.copy(asrState = it.asrState.copy(error = "Microphone permission not granted."))
+            }
+            return
+        }
+        val ctx = whisperContext ?: run {
+            _uiState.update {
+                it.copy(asrState = it.asrState.copy(error = "Whisper model not loaded."))
+            }
             return
         }
 
-        val file = File(getApplication<Application>().cacheDir, "recording.wav")
-        audioFile = file
+        // Fresh channel for this session
+        translationQueue = Channel(Channel.UNLIMITED)
 
         _uiState.update {
             it.copy(
                 recordingState = RecordingState.RECORDING,
-                recordingError = null,
-                sourceTranscript = "",
-                translatedText = "",
-                transcriptionError = null,
-                translationError = null
+                asrState = it.asrState.copy(
+                    error = null,
+                    liveCaption = "",
+                    sourceTranscript = ""
+                ),
+                llmState = it.llmState.copy(
+                    error = null,
+                    isTranslating = false,
+                    translatedText = ""
+                )
             )
         }
 
-        viewModelScope.launch {
-            recorder.startRecording(file) { e ->
-                _uiState.update { it.copy(recordingError = e.message) }
+        // ── Job 1: Transcription ──────────────────────────────────────────────
+        transcriptionJob = viewModelScope.launch {
+            StreamingTranscriber(ctx)
+                .start()
+                .catch { e ->
+                    _uiState.update {
+                        it.copy(
+                            recordingState = RecordingState.IDLE,
+                            asrState = it.asrState.copy(error = "Transcription error: ${e.message}")
+                        )
+                    }
+                    translationQueue.close()
+                }
+                .collect { segment ->
+                    when (segment) {
+                        is TranscriptionSegment.Partial -> {
+                            _uiState.update {
+                                it.copy(asrState = it.asrState.copy(liveCaption = segment.text))
+                            }
+                        }
+
+                        is TranscriptionSegment.Committed -> {
+                            val chunk = segment.text.trim()
+                            if (chunk.isNotBlank()) {
+                                _uiState.update {
+                                    val sep = if (it.asrState.sourceTranscript.isBlank()) "" else " "
+                                    it.copy(
+                                        asrState = it.asrState.copy(
+                                            sourceTranscript = it.asrState.sourceTranscript + sep + chunk
+                                        )
+                                    )
+                                }
+                                translationQueue.send(chunk)
+                            }
+                        }
+                    }
+                }
+        }
+
+        // ── Job 2: Translation ────────────────────────────────────────────────
+        translationJob = viewModelScope.launch {
+            _uiState.update { it.copy(llmState = it.llmState.copy(isTranslating = true)) }
+            try {
+                for (chunk in translationQueue) {
+                    translateChunk(
+                        text   = chunk,
+                        source = _uiState.value.sourceLanguage,
+                        target = _uiState.value.targetLanguage,
+                    )
+                }
+            } catch (e: ClosedReceiveChannelException) {
+                // Normal shutdown path
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(llmState = it.llmState.copy(error = e.message))
+                }
+            } finally {
+                _uiState.update {
+                    it.copy(
+                        recordingState = RecordingState.IDLE,
+                        llmState = it.llmState.copy(isTranslating = false)
+                    )
+                }
+
+                val finalText = _uiState.value.llmState.translatedText.trim()
+                if (finalText.isNotBlank()) speakTranslation(finalText)
             }
         }
     }
 
     fun stopRecording() {
-        viewModelScope.launch {
-            recorder.stopRecording()
-            _uiState.update { it.copy(recordingState = RecordingState.PROCESSING) }
-            processAudioFile()
+        if (!_uiState.value.canStopRecording) return
+
+        transcriptionJob?.cancel()
+        transcriptionJob = null
+
+        val lastPartial = _uiState.value.asrState.liveCaption.trim()
+        if (lastPartial.isNotBlank()) {
+            translationQueue.trySend(lastPartial)
+            _uiState.update {
+                val sep = if (it.asrState.sourceTranscript.isBlank()) "" else " "
+                it.copy(
+                    asrState = it.asrState.copy(
+                        sourceTranscript = it.asrState.sourceTranscript + sep + lastPartial,
+                        liveCaption = ""
+                    )
+                )
+            }
         }
+
+        translationQueue.close()
+
+        _uiState.update { it.copy(recordingState = RecordingState.PROCESSING) }
     }
 
     fun cancelRecording() {
-        viewModelScope.launch {
-            recorder.stopRecording()
-            audioFile?.delete()
-            _uiState.update { it.copy(recordingState = RecordingState.IDLE) }
+        transcriptionJob?.cancel()
+        transcriptionJob = null
+        translationJob?.cancel()
+        translationJob = null
+        translationQueue.close()
+
+        _uiState.update {
+            it.copy(
+                recordingState = RecordingState.IDLE,
+                asrState = it.asrState.copy(liveCaption = ""),
+                llmState = it.llmState.copy(isTranslating = false)
+            )
         }
     }
 
     // -------------------------------------------------------------------------
-    // Processing Pipeline
+    // LLM
     // -------------------------------------------------------------------------
 
-    private fun processAudioFile() {
-        viewModelScope.launch {
-            try {
-                val file = audioFile ?: throw Exception("No audio file")
-
-                val samples = decodeWaveFile(file)
-
-                val transcript = withContext(Dispatchers.Default) {
-                    whisperContext?.transcribeData(samples)
-                        ?: throw Exception("Whisper not initialized")
-                }.trim()
-
-                _uiState.update { it.copy(sourceTranscript = transcript) }
-
-                if (transcript.isBlank()) {
-                    _uiState.update {
-                        it.copy(
-                            recordingState = RecordingState.IDLE,
-                            transcriptionError = "No speech detected."
-                        )
-                    }
-                    return@launch
-                }
-
-                streamTranslation(
-                    text = transcript,
-                    source = _uiState.value.sourceLanguage,
-                    target = _uiState.value.targetLanguage
-                )
-
-            } catch (e: Exception) {
-                _uiState.update {
-                    it.copy(
-                        recordingState = RecordingState.IDLE,
-                        transcriptionError = e.message
-                    )
-                }
-            } finally {
-                audioFile?.delete()
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Translation (LLM)
-    // -------------------------------------------------------------------------
-
-    private suspend fun streamTranslation(
+    private suspend fun translateChunk(
         text: String,
         source: Language,
-        target: Language
+        target: Language,
     ) = withContext(Dispatchers.IO) {
-
         val currentEngine = engine
             ?: throw IllegalStateException("Engine not ready")
 
         val config = ConversationConfig(
             systemInstruction = Contents.of(
-                "Translate from ${source.displayName} to ${target.displayName}. Output only translation."
+                "You are a professional translation engine. " +
+                        "Translate from ${source.displayName} to ${target.displayName}. " +
+                        "Output only the translated text — no explanations, no alternatives.",
             ),
-            samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 0.3)
+            samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 0.3),
         )
 
-        val result = StringBuilder()
-
         currentEngine.createConversation(config).use { conversation ->
+            val needsSeparator = _uiState.value.llmState.translatedText.isNotBlank()
+            if (needsSeparator) {
+                _uiState.update {
+                    it.copy(llmState = it.llmState.copy(translatedText = it.llmState.translatedText + " "))
+                }
+            }
+
             conversation.sendMessageAsync(text)
-                .catch { e ->
-                    throw Exception("Translation error: ${e.message}")
-                }
+                .catch { e -> throw Exception("Translation stream error: ${e.message}") }
                 .collect { token ->
-                    val chunk = token.toString()
-                    result.append(chunk)
-                    _uiState.update { it.copy(translatedText = it.translatedText + chunk) }
+                    _uiState.update {
+                        it.copy(llmState = it.llmState.copy(translatedText = it.llmState.translatedText + token.toString()))
+                    }
                 }
-        }
-
-        val finalText = result.toString().trim()
-
-        _uiState.update {
-            it.copy(
-                translatedText = finalText,
-                recordingState = RecordingState.IDLE
-            )
-        }
-
-        if (finalText.isNotBlank()) {
-            speakTranslation(finalText)
         }
     }
 
@@ -226,14 +305,12 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
     // TTS
     // -------------------------------------------------------------------------
 
-    fun speakTranslation(text: String = _uiState.value.translatedText) {
-        if (text.isBlank() || !_uiState.value.isTtsReady) return
-
+    fun speakTranslation(text: String = _uiState.value.llmState.translatedText) {
+        if (text.isBlank() || !_uiState.value.ttsState.isReady) return
         _uiState.update { it.copy(playbackState = PlaybackState.PLAYING) }
-
         ttsPlayer.speak(
-            text = text,
-            languageCode = _uiState.value.targetLanguage.code
+            text         = text,
+            languageCode = _uiState.value.targetLanguage.code,
         ) {
             _uiState.update { it.copy(playbackState = PlaybackState.IDLE) }
         }
@@ -268,10 +345,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
     fun swapLanguages() {
         _uiState.update {
-            it.copy(
-                sourceLanguage = it.targetLanguage,
-                targetLanguage = it.sourceLanguage
-            )
+            it.copy(sourceLanguage = it.targetLanguage, targetLanguage = it.sourceLanguage)
         }
     }
 
@@ -281,10 +355,10 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
     override fun onCleared() {
         super.onCleared()
+        transcriptionJob?.cancel()
+        translationJob?.cancel()
+        translationQueue.close()
         ttsPlayer.shutdown()
-
-        viewModelScope.launch {
-            whisperContext?.release()
-        }
+        viewModelScope.launch { whisperContext?.release() }
     }
 }

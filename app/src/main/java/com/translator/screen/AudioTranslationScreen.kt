@@ -1,7 +1,3 @@
-// AudioTranslationScreen.kt
-// Jetpack Compose screen for the realtime Whisper → LLM translation feature.
-// Displays live captions while recording, final transcript, and streaming translation.
-
 package com.translator.screen
 
 import androidx.compose.animation.AnimatedVisibility
@@ -31,7 +27,7 @@ import com.translator.ui.state.Language
 import com.translator.ui.state.PlaybackState
 import com.translator.ui.state.RecordingState
 import com.translator.ui.viewmodel.AudioTranslationViewModel
-import com.translator.ui.state.LanguageRepository
+
 @Composable
 fun AudioTranslationScreen(
     viewModel: AudioTranslationViewModel,
@@ -39,6 +35,9 @@ fun AudioTranslationScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val scrollState = rememberScrollState()
+
+    // Helper variable to replace the old state.isTranscribing
+    val isTranscribing = state.recordingState != RecordingState.IDLE
 
     Column(
         modifier = modifier
@@ -55,7 +54,7 @@ fun AudioTranslationScreen(
         )
 
         // ---- Model loading indicators ----
-        if (state.isWhisperLoading) {
+        if (state.asrState.isLoading) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -65,8 +64,10 @@ fun AudioTranslationScreen(
             }
         }
 
-        state.whisperError?.let { ErrorBanner(it) }
-        state.engineError?.let { ErrorBanner(it) }
+        // Consolidated Error Banners
+        state.asrState.error?.let { ErrorBanner("Audio/ASR Error: $it") }
+        state.llmState.error?.let { ErrorBanner("Translation Error: $it") }
+        state.ttsState.error?.let { ErrorBanner("Playback Error: $it") }
 
         // ---- Language pair row ----
         LanguagePairRow(
@@ -86,32 +87,28 @@ fun AudioTranslationScreen(
             onCancel       = viewModel::cancelRecording,
         )
 
-        state.recordingError?.let { ErrorBanner(it) }
-
         // ---- Live captions (shown while recording) ----
-        AnimatedVisibility(state.isTranscribing && state.sourceTranscript.isNotBlank()) {
+        AnimatedVisibility(isTranscribing && state.asrState.sourceTranscript.isNotBlank()) {
             TranscriptCard(
                 label = "Listening…",
-                text  = state.sourceTranscript,
+                text  = state.asrState.sourceTranscript,
                 isLive = true,
             )
         }
 
         // ---- Final transcript ----
         AnimatedVisibility(
-            !state.isTranscribing && state.sourceTranscript.isNotBlank()
+            !isTranscribing && state.asrState.sourceTranscript.isNotBlank()
         ) {
             TranscriptCard(
                 label  = "You said (${state.sourceLanguage.displayName})",
-                text   = state.sourceTranscript,
+                text   = state.asrState.sourceTranscript,
                 isLive = false,
             )
         }
 
-        state.transcriptionError?.let { ErrorBanner(it) }
-
         // ---- Translation output ----
-        AnimatedVisibility(state.translatedText.isNotBlank()) {
+        AnimatedVisibility(state.llmState.translatedText.isNotBlank()) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
@@ -131,7 +128,7 @@ fun AudioTranslationScreen(
                         )
                         IconButton(
                             onClick  = viewModel::speakTranslation,
-                            enabled  = state.isTtsReady &&
+                            enabled  = state.ttsState.isReady &&
                                     state.playbackState == PlaybackState.IDLE,
                         ) {
                             Icon(
@@ -143,19 +140,17 @@ fun AudioTranslationScreen(
                     }
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        text  = state.translatedText,
+                        text  = state.llmState.translatedText,
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                     )
-                    if (state.recordingState == RecordingState.PROCESSING) {
+                    if (state.recordingState == RecordingState.PROCESSING || state.llmState.isTranslating) {
                         Spacer(Modifier.height(4.dp))
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     }
                 }
             }
         }
-
-        state.translationError?.let { ErrorBanner(it) }
     }
 }
 
@@ -216,7 +211,6 @@ private fun RecordButton(
         }
     }
 
-    // Status label beneath button
     Text(
         text  = when (recordingState) {
             RecordingState.IDLE       -> if (enabled) "Tap to speak" else "Loading…"
@@ -333,7 +327,8 @@ private fun LanguageDropdown(
             expanded        = expanded,
             onDismissRequest = { expanded = false },
         ) {
-            LanguageRepository.languages.forEach { lang ->
+            // Updated to use the new Enum entries instead of LanguageRepository
+            Language.entries.forEach { lang ->
                 DropdownMenuItem(
                     text = { Text(lang.displayName) },
                     onClick = {

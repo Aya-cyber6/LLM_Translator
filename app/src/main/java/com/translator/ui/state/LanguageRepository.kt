@@ -1,29 +1,27 @@
 package com.translator.ui.state
 
-object LanguageRepository {
+enum class Language(val code: String, val displayName: String, val nativeName: String) {
+    EN("en", "English", "English"),
+    TR("tr", "Turkish", "Türkçe"),
+    ES("es", "Spanish", "Español"),
+    FR("fr", "French", "Français"),
+    DE("de", "German", "Deutsch"),
+    IT("it", "Italian", "Italiano"),
+    PT("pt", "Portuguese", "Português"),
+    RU("ru", "Russian", "Русский"),
+    ZH("zh", "Chinese", "中文"),
+    JA("ja", "Japanese", "日本語"),
+    KO("ko", "Korean", "한국어"),
+    AR("ar", "Arabic", "العربية"),
+    HI("hi", "Hindi", "हिन्दी"),
+    NL("nl", "Dutch", "Nederlands"),
+    PL("pl", "Polish", "Polski"),
+    SV("sv", "Swedish", "Svenska"),
+    UK("uk", "Ukrainian", "Українська");
 
-    val languages: List<Language> = listOf(
-        Language("en", "English", "English"),
-        Language("tr", "Turkish", "Türkçe"),
-        Language("es", "Spanish", "Español"),
-        Language("fr", "French", "Français"),
-        Language("de", "German", "Deutsch"),
-        Language("it", "Italian", "Italiano"),
-        Language("pt", "Portuguese", "Português"),
-        Language("ru", "Russian", "Русский"),
-        Language("zh", "Chinese", "中文"),
-        Language("ja", "Japanese", "日本語"),
-        Language("ko", "Korean", "한국어"),
-        Language("ar", "Arabic", "العربية"),
-        Language("hi", "Hindi", "हिन्दी"),
-        Language("nl", "Dutch", "Nederlands"),
-        Language("pl", "Polish", "Polski"),
-        Language("sv", "Swedish", "Svenska"),
-        Language("uk", "Ukrainian", "Українська") // ✅ removed comma
-    )
-
-    val defaultSource: Language = languages.first { it.code == "en" }
-    val defaultTarget: Language = languages.first { it.code == "tr" }
-
-    fun byCode(code: String): Language? = languages.find { it.code == code }
+    companion object {
+        val defaultSource = EN
+        val defaultTarget = TR
+        fun byCode(code: String): Language? = entries.find { it.code == code }
+    }
 }
