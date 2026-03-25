@@ -21,5 +21,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "LLMTRanslator"
 include(":app")
-include (":lib")
- 

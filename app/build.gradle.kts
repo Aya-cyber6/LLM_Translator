@@ -54,7 +54,6 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
-    implementation(project(":lib"))
 
     // For Android
     implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")

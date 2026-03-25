@@ -17,13 +17,11 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import com.translator.screen.AudioTranslationScreen
 import com.translator.screen.TextTranslationScreen
-// import com.translator.ui.theme.LLMTRanslatorTheme
 import com.translator.ui.viewmodel.AudioTranslationViewModel
 import com.translator.ui.viewmodel.TranslationViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
-import com.translator.audio.WhisperModelLoader
 
 class MainActivity : ComponentActivity() {
 
@@ -36,7 +34,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-        initModels()
+        initModel()
 
         setContent {
                 TranslatorApp(
@@ -50,7 +48,7 @@ class MainActivity : ComponentActivity() {
     // Copy model asset once, init engine, share with audio VM
     // -------------------------------------------------------------------------
 
-    private fun initModels() {
+    private fun initModel() {
         lifecycleScope.launch(Dispatchers.IO) {
             val modelFile = File(filesDir, "Gemma3-1B-IT_multi-prefill-seq_q4_ekv4096.litertlm")
             if (!modelFile.exists()) {
@@ -63,14 +61,6 @@ class MainActivity : ComponentActivity() {
             textViewModel.waitForEngine { engine ->
                 audioViewModel.attachEngine(engine)
             }
-            // 2️⃣ Initialize Whisper model
-            val whisperModelPath = WhisperModelLoader.ensureModel(
-                context = this@MainActivity,
-                assetFileName = "ggml-tiny.bin"
-            )
-
-            // Load Whisper model in the AudioTranslationViewModel
-            audioViewModel.loadWhisperModel(whisperModelPath)
         }
     }
 }

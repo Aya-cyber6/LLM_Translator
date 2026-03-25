@@ -26,7 +26,7 @@ data class AudioTranslationUiState(
 
 // Grouped sub-states mapping directly to your pipeline:
 data class AsrState(
-    val isReady: Boolean = false,
+    val isReady: Boolean = true,
     val isLoading: Boolean = false,
     val error: String? = null,
     val liveCaption: String = "",

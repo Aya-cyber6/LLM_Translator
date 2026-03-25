@@ -11,14 +11,13 @@ import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.SamplerConfig
-import com.translator.audio.StreamingTranscriber
+import com.translator.audio.AndroidSpeechTranscriber
 import com.translator.audio.TranscriptionSegment
 import com.translator.audio.TtsPlayer
 import com.translator.ui.state.AudioTranslationUiState
 import com.translator.ui.state.Language
 import com.translator.ui.state.PlaybackState
 import com.translator.ui.state.RecordingState
-import com.whispercpp.whisper.WhisperContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -45,7 +44,6 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
     // -------------------------------------------------------------------------
 
     private var engine: Engine? = null
-    private var whisperContext: WhisperContext? = null
     private val ttsPlayer = TtsPlayer(application)
 
     // -------------------------------------------------------------------------
@@ -73,36 +71,6 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
-    fun loadWhisperModel(modelPath: String) {
-        viewModelScope.launch {
-            _uiState.update { state ->
-                state.copy(
-                    asrState = state.asrState.copy(
-                        isLoading = true,
-                        error = null
-                    )
-                )
-            }
-            try {
-                val ctx = withContext(Dispatchers.IO) {
-                    WhisperContext.createContextFromFile(modelPath)
-                }
-                whisperContext = ctx
-                _uiState.update {
-                    it.copy(asrState = it.asrState.copy(isReady = true, isLoading = false))
-                }
-            } catch (e: Exception) {
-                _uiState.update {
-                    it.copy(
-                        asrState = it.asrState.copy(
-                            isLoading = false,
-                            error     = "Failed to load Whisper model: ${e.message}"
-                        )
-                    )
-                }
-            }
-        }
-    }
 
     fun initTts() {
         ttsPlayer.init { ready ->
@@ -122,12 +90,6 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         ) {
             _uiState.update {
                 it.copy(asrState = it.asrState.copy(error = "Microphone permission not granted."))
-            }
-            return
-        }
-        val ctx = whisperContext ?: run {
-            _uiState.update {
-                it.copy(asrState = it.asrState.copy(error = "Whisper model not loaded."))
             }
             return
         }
@@ -153,8 +115,11 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
         // ── Job 1: Transcription ──────────────────────────────────────────────
         transcriptionJob = viewModelScope.launch {
-            StreamingTranscriber(ctx)
-                .start()
+            // Grab the language code from your state (e.g., "en-US", "tr-TR")
+            val sourceLangCode = _uiState.value.sourceLanguage.code
+
+            AndroidSpeechTranscriber(getApplication())
+                .start(sourceLangCode)
                 .catch { e ->
                     _uiState.update {
                         it.copy(
@@ -171,7 +136,6 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                                 it.copy(asrState = it.asrState.copy(liveCaption = segment.text))
                             }
                         }
-
                         is TranscriptionSegment.Committed -> {
                             val chunk = segment.text.trim()
                             if (chunk.isNotBlank()) {
@@ -184,6 +148,11 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                                     )
                                 }
                                 translationQueue.send(chunk)
+                            }
+                        }
+                        is TranscriptionSegment.Error -> {
+                            _uiState.update {
+                                it.copy(asrState = it.asrState.copy(error = segment.message))
                             }
                         }
                     }
@@ -359,6 +328,5 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         translationJob?.cancel()
         translationQueue.close()
         ttsPlayer.shutdown()
-        viewModelScope.launch { whisperContext?.release() }
     }
 }
