@@ -93,7 +93,7 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
                     samplerConfig = SamplerConfig(
                         topK = 40,
                         topP = 0.95,
-                        temperature = 0.3
+                        temperature = 0.1
                     )
                 )
 

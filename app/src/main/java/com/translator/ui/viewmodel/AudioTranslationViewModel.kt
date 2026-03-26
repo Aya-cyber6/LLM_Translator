@@ -13,6 +13,7 @@ import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.Conversation
 import com.google.mlkit.genai.common.DownloadStatus
 import com.google.mlkit.genai.common.FeatureStatus
 import com.google.mlkit.genai.common.audio.AudioSource
@@ -54,6 +55,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
     private var translationJob: Job? = null
     private val perfLogger = PerformanceLogger()
     private var translationQueue: Channel<Pair<String, String>> = Channel(Channel.UNLIMITED)
+    private var activeConversation: Conversation? = null
     // -------------------------------------------------------------------------
     // Auto-init on ViewModel creation
     // -------------------------------------------------------------------------
@@ -304,37 +306,57 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         }
 
         // ── Translation job ───────────────────────────────────────────────────
+        // ── Translation job ───────────────────────────────────────────────────
         translationJob = viewModelScope.launch {
             _uiState.update { it.copy(isTranslating = true) }
+
+            // 1. Initialize the conversation ONCE for this entire recording session
+            val currentEngine = engine
+            if (currentEngine != null) {
+                val config = ConversationConfig(
+                    systemInstruction = Contents.of(
+                        "You are an expert bilingual interpreter translating real-time spoken audio. " +
+                                "Translate the following text strictly from ${_uiState.value.sourceLanguage.displayName} to ${_uiState.value.targetLanguage.displayName}. " +
+                                "Output only the translated text."
+                    ),
+                    // Use strict, deterministic sampling to prevent hallucinations
+                    samplerConfig = SamplerConfig(topK = 10, topP = 0.9, temperature = 0.1)
+                )
+                activeConversation = currentEngine.createConversation(config)
+            }
+
             try {
                 for (queueItem in translationQueue) {
                     val chunkId = queueItem.first
                     val textToTranslate = queueItem.second
 
+                    // Notice we don't pass source/target anymore, the activeConversation already knows!
                     val translatedChunk = translateChunk(
                         chunkId = chunkId,
-                        text   = textToTranslate,
-                        source = _uiState.value.sourceLanguage,
-                        target = _uiState.value.targetLanguage,
+                        text    = textToTranslate
                     )
 
                     if (translatedChunk.isNotBlank()) {
-                        perfLogger.markTtsStart(chunkId) // ⏱️ Mark TTS Start & Print Report!
+                        perfLogger.markTtsStart(chunkId)
                         speakTranslation(translatedChunk)
                     }
                 }
             } catch (e: kotlinx.coroutines.channels.ClosedReceiveChannelException) {
-                // Normal exit when the channel is closed. DO NOTHING.
+                // Normal exit
             } catch (e: Exception) {
-                // Log the error instead of letting it crash the app
                 android.util.Log.e("AudioTranslator", "Translation error", e)
                 _uiState.update { it.copy(translationError = e.message) }
             } finally {
                 _uiState.update {
                     it.copy(isTranslating = false, recordingState = RecordingState.IDLE)
                 }
+
+                // CRITICAL: Close and clear the conversation when recording stops to free up RAM!
+                activeConversation?.close()
+                activeConversation = null
             }
-        }    }
+        }
+       }
 
     fun stopRecording() {
         if (!_uiState.value.canStopRecording) return
@@ -352,6 +374,8 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         transcriptionJob?.cancel()
         translationJob?.cancel()
         translationQueue.close()
+        activeConversation?.close()
+        activeConversation = null
         _uiState.update {
             it.copy(
                 recordingState = RecordingState.IDLE,
@@ -395,41 +419,36 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
     // -------------------------------------------------------------------------
     // LLM translation
     // -------------------------------------------------------------------------
-
-    private suspend fun translateChunk(chunkId: String, text: String, source: Language, target: Language): String =
+    private suspend fun translateChunk(chunkId: String, text: String): String =
         withContext(Dispatchers.IO) {
-            val currentEngine = engine ?: throw IllegalStateException("Engine not ready")
+            // Grab the already-open conversation
+            val conversation = activeConversation
+                ?: throw IllegalStateException("Conversation was not initialized")
 
-            val config = ConversationConfig(
-                systemInstruction = Contents.of(
-                    "You are a professional translation engine. " +
-                            "Translate from ${source.displayName} to ${target.displayName}. " +
-                            "Output only the translated text — no explanations, no alternatives.",
-                ),
-                samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 0.3),
-            )
+            var newlyTranslatedChunk = ""
 
-            var newlyTranslatedChunk = "" // Create a local buffer
+            perfLogger.markLlmStart(chunkId)
 
-            perfLogger.markLlmStart(chunkId) // ⏱️ Mark LLM Start
-
-            currentEngine.createConversation(config).use { conversation ->
-                if (_uiState.value.translatedText.isNotBlank()) {
-                    _uiState.update { it.copy(translatedText = it.translatedText + " ") }
-                }
-                conversation.sendMessageAsync(text)
-                    .catch { e -> throw Exception("Translation error: ${e.message}") }
-                    .collect { token ->
-                        perfLogger.markLlmFirstToken(chunkId) // ⏱️ Tracks TTFT and counts tokens
-
-                        val tokenStr = token.toString()
-                        newlyTranslatedChunk += tokenStr // Add to our local buffer
-                        _uiState.update { it.copy(translatedText = it.translatedText + tokenStr) }
-                    }
+            if (_uiState.value.translatedText.isNotBlank()) {
+                _uiState.update { it.copy(translatedText = it.translatedText + " ") }
             }
-            perfLogger.markLlmEnd(chunkId) // ⏱️ Mark LLM End
-            return@withContext newlyTranslatedChunk // Return the completed chunk
+
+            // DO NOT use `.use {}` here. We want this conversation to stay open!
+            conversation.sendMessageAsync(text)
+                .catch { e -> throw Exception("Translation error: ${e.message}") }
+                .collect { token ->
+                    perfLogger.markLlmFirstToken(chunkId)
+
+                    val tokenStr = token.toString()
+                    newlyTranslatedChunk += tokenStr
+                    _uiState.update { it.copy(translatedText = it.translatedText + tokenStr) }
+                }
+
+            perfLogger.markLlmEnd(chunkId)
+
+            return@withContext newlyTranslatedChunk
         }
+
     // -------------------------------------------------------------------------
     // TTS
     // -------------------------------------------------------------------------
@@ -458,5 +477,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         translationQueue.close()
         speechRecognizer?.close()
         ttsPlayer.shutdown()
+        activeConversation?.close()
+        activeConversation = null
     }
 }
