@@ -168,7 +168,6 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
                 it.copy(sourceLanguage = language)
         }
     }
-
     fun setTargetLanguage(language: Language) {
         _uiState.update {
             if (language.code == it.sourceLanguage.code)
@@ -177,7 +176,6 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
                 it.copy(targetLanguage = language)
         }
     }
-
     fun swapLanguages() {
         _uiState.update {
             it.copy(

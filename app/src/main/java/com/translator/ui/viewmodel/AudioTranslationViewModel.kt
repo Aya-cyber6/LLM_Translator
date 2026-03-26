@@ -31,7 +31,6 @@ import com.translator.ui.state.RecordingState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -41,7 +40,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
-
+import java.util.UUID
+import com.translator.util.PerformanceLogger
 class AudioTranslationViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(AudioTranslationUiState())
@@ -50,19 +50,17 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
     private var engine: Engine? = null
     private var speechRecognizer: SpeechRecognizer? = null
     private val ttsPlayer = TtsPlayer(application)
-
     private var transcriptionJob: Job? = null
     private var translationJob: Job? = null
-    private var translationQueue: Channel<String> = Channel(Channel.UNLIMITED)
-
+    private val perfLogger = PerformanceLogger()
+    private var translationQueue: Channel<Pair<String, String>> = Channel(Channel.UNLIMITED)
     // -------------------------------------------------------------------------
     // Auto-init on ViewModel creation
     // -------------------------------------------------------------------------
 
     init {
-        // Kick off model check immediately — the UI starts in CHECKING and this
-        // is the only thing that moves it forward.
         loadModel(Language.ENGLISH.locale)
+        initTts()
     }
 
     // -------------------------------------------------------------------------
@@ -255,7 +253,11 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                             _uiState.update { it.copy(liveCaption = response.text) }
 
                         is SpeechRecognizerResponse.FinalTextResponse -> {
+
                             val chunk = response.text.trim()
+                            val chunkId = UUID.randomUUID().toString()
+                            perfLogger.startChunk(chunkId, chunk) // ⏱️ Start the ASR->TTS timer!
+
                             if (chunk.isNotBlank()) {
                                 _uiState.update {
                                     val sep = if (it.sourceTranscript.isBlank()) "" else " "
@@ -264,12 +266,15 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                                         liveCaption      = "",
                                     )
                                 }
-                                translationQueue.send(chunk)
+                                translationQueue.send(Pair(chunkId, chunk)) // Send the ID and text
                             }
                         }
 
                         is SpeechRecognizerResponse.CompletedResponse -> {
                             val lastPartial = _uiState.value.liveCaption.trim()
+
+                            val chunkId = UUID.randomUUID().toString()
+                            perfLogger.startChunk(chunkId, lastPartial) // ⏱️ Start the ASR->TTS timer!
                             if (lastPartial.isNotBlank()) {
                                 _uiState.update {
                                     val sep = if (it.sourceTranscript.isBlank()) "" else " "
@@ -278,7 +283,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                                         liveCaption      = "",
                                     )
                                 }
-                                translationQueue.send(lastPartial)
+                                translationQueue.send(Pair(chunkId, lastPartial)) // Send the ID and text
                             }
                             translationQueue.close()
                             _uiState.update { it.copy(recordingState = RecordingState.PROCESSING) }
@@ -302,30 +307,44 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         translationJob = viewModelScope.launch {
             _uiState.update { it.copy(isTranslating = true) }
             try {
-                for (chunk in translationQueue) {
-                    translateChunk(
-                        text   = chunk,
+                for (queueItem in translationQueue) {
+                    val chunkId = queueItem.first
+                    val textToTranslate = queueItem.second
+
+                    val translatedChunk = translateChunk(
+                        chunkId = chunkId,
+                        text   = textToTranslate,
                         source = _uiState.value.sourceLanguage,
                         target = _uiState.value.targetLanguage,
                     )
+
+                    if (translatedChunk.isNotBlank()) {
+                        perfLogger.markTtsStart(chunkId) // ⏱️ Mark TTS Start & Print Report!
+                        speakTranslation(translatedChunk)
+                    }
                 }
-            } catch (_: ClosedReceiveChannelException) {
-                // Normal exit
+            } catch (e: kotlinx.coroutines.channels.ClosedReceiveChannelException) {
+                // Normal exit when the channel is closed. DO NOTHING.
             } catch (e: Exception) {
+                // Log the error instead of letting it crash the app
+                android.util.Log.e("AudioTranslator", "Translation error", e)
                 _uiState.update { it.copy(translationError = e.message) }
             } finally {
                 _uiState.update {
                     it.copy(isTranslating = false, recordingState = RecordingState.IDLE)
                 }
-                val finalText = _uiState.value.translatedText.trim()
-                if (finalText.isNotBlank()) speakTranslation(finalText)
             }
-        }
-    }
+        }    }
 
     fun stopRecording() {
         if (!_uiState.value.canStopRecording) return
+
+        // Tell the recognizer to stop listening
         viewModelScope.launch { speechRecognizer?.stopRecognition() }
+
+        // The recognizer will eventually fire SpeechRecognizerResponse.CompletedResponse
+        // Let THAT response close the queue, do NOT close it here manually.
+        _uiState.update { it.copy(recordingState = RecordingState.PROCESSING) }
     }
 
     fun cancelRecording() {
@@ -353,7 +372,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
             else
                 it.copy(sourceLanguage = language)
         }
-        loadModel(language.locale)   // pass the full BCP-47 locale, not Locale(code)
+        loadModel(language.locale)
     }
 
     fun setTargetLanguage(language: Language) {
@@ -377,7 +396,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
     // LLM translation
     // -------------------------------------------------------------------------
 
-    private suspend fun translateChunk(text: String, source: Language, target: Language) =
+    private suspend fun translateChunk(chunkId: String, text: String, source: Language, target: Language): String =
         withContext(Dispatchers.IO) {
             val currentEngine = engine ?: throw IllegalStateException("Engine not ready")
 
@@ -390,6 +409,10 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                 samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 0.3),
             )
 
+            var newlyTranslatedChunk = "" // Create a local buffer
+
+            perfLogger.markLlmStart(chunkId) // ⏱️ Mark LLM Start
+
             currentEngine.createConversation(config).use { conversation ->
                 if (_uiState.value.translatedText.isNotBlank()) {
                     _uiState.update { it.copy(translatedText = it.translatedText + " ") }
@@ -397,11 +420,16 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                 conversation.sendMessageAsync(text)
                     .catch { e -> throw Exception("Translation error: ${e.message}") }
                     .collect { token ->
-                        _uiState.update { it.copy(translatedText = it.translatedText + token.toString()) }
+                        perfLogger.markLlmFirstToken(chunkId) // ⏱️ Tracks TTFT and counts tokens
+
+                        val tokenStr = token.toString()
+                        newlyTranslatedChunk += tokenStr // Add to our local buffer
+                        _uiState.update { it.copy(translatedText = it.translatedText + tokenStr) }
                     }
             }
+            perfLogger.markLlmEnd(chunkId) // ⏱️ Mark LLM End
+            return@withContext newlyTranslatedChunk // Return the completed chunk
         }
-
     // -------------------------------------------------------------------------
     // TTS
     // -------------------------------------------------------------------------
