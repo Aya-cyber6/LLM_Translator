@@ -11,6 +11,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Stop
@@ -24,6 +25,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.dp
 import com.translator.ui.state.Language
+import com.translator.ui.state.ModelStatus
 import com.translator.ui.state.PlaybackState
 import com.translator.ui.state.RecordingState
 import com.translator.ui.viewmodel.AudioTranslationViewModel
@@ -35,9 +37,6 @@ fun AudioTranslationScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val scrollState = rememberScrollState()
-
-    // Helper variable to replace the old state.isTranscribing
-    val isTranscribing = state.recordingState != RecordingState.IDLE
 
     Column(
         modifier = modifier
@@ -53,23 +52,52 @@ fun AudioTranslationScreen(
             style = MaterialTheme.typography.headlineMedium,
         )
 
-        // ---- Model loading indicators ----
-        if (state.asrState.isLoading) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                Text("Loading Whisper model…", style = MaterialTheme.typography.bodySmall)
+        // ── Model status banner ───────────────────────────────────────────────
+        when (state.modelStatus) {
+            ModelStatus.CHECKING -> {
+                Row(
+                    verticalAlignment     = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text("Checking speech model…", style = MaterialTheme.typography.bodySmall)
+                }
             }
+            ModelStatus.DOWNLOADING -> {
+                Row(
+                    verticalAlignment     = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(
+                        state.downloadProgress ?: "Downloading model…",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            ModelStatus.DOWNLOADABLE -> {
+                OutlinedButton(
+                    onClick = viewModel::downloadModel,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Icons.Default.Download, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Download speech model to enable mic")
+                }
+            }
+            ModelStatus.UNAVAILABLE -> {
+                ErrorBanner("Speech recognition is not available on this device.")
+            }
+            ModelStatus.AVAILABLE -> { /* nothing — mic button becomes enabled */ }
         }
 
-        // Consolidated Error Banners
-        state.asrState.error?.let { ErrorBanner("Audio/ASR Error: $it") }
-        state.llmState.error?.let { ErrorBanner("Translation Error: $it") }
-        state.ttsState.error?.let { ErrorBanner("Playback Error: $it") }
+        // ── Error banners ─────────────────────────────────────────────────────
+        state.modelError?.let         { ErrorBanner(it) }
+        state.recordingError?.let     { ErrorBanner(it) }
+        state.transcriptionError?.let { ErrorBanner(it) }
+        state.translationError?.let   { ErrorBanner(it) }
 
-        // ---- Language pair row ----
+        // ── Language pair row ─────────────────────────────────────────────────
         LanguagePairRow(
             source   = state.sourceLanguage,
             target   = state.targetLanguage,
@@ -78,7 +106,7 @@ fun AudioTranslationScreen(
             onTarget = viewModel::setTargetLanguage,
         )
 
-        // ---- Record button ----
+        // ── Record button ─────────────────────────────────────────────────────
         RecordButton(
             recordingState = state.recordingState,
             enabled        = state.canRecord || state.canStopRecording,
@@ -87,37 +115,38 @@ fun AudioTranslationScreen(
             onCancel       = viewModel::cancelRecording,
         )
 
-        // ---- Live captions (shown while recording) ----
-        AnimatedVisibility(isTranscribing && state.asrState.sourceTranscript.isNotBlank()) {
+        // ── Live caption (PartialTextResponse — overwritten each update) ──────
+        AnimatedVisibility(state.showLiveCaption) {
             TranscriptCard(
-                label = "Listening…",
-                text  = state.asrState.sourceTranscript,
+                label  = "Listening…",
+                text   = state.liveCaption,
                 isLive = true,
             )
         }
 
-        // ---- Final transcript ----
-        AnimatedVisibility(
-            !isTranscribing && state.asrState.sourceTranscript.isNotBlank()
-        ) {
+        // ── Committed source transcript (FinalTextResponse segments) ──────────
+        AnimatedVisibility(state.sourceTranscript.isNotBlank()) {
             TranscriptCard(
-                label  = "You said (${state.sourceLanguage.displayName})",
-                text   = state.asrState.sourceTranscript,
-                isLive = false,
+                label  = if (state.recordingState == RecordingState.IDLE)
+                    "You said (${state.sourceLanguage.displayName})"
+                else
+                    "Transcribing…",
+                text   = state.sourceTranscript,
+                isLive = state.recordingState != RecordingState.IDLE,
             )
         }
 
-        // ---- Translation output ----
-        AnimatedVisibility(state.llmState.translatedText.isNotBlank()) {
+        // ── Translation output ────────────────────────────────────────────────
+        AnimatedVisibility(state.translatedText.isNotBlank()) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
+                colors   = CardDefaults.cardColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                 ),
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
-                        verticalAlignment   = Alignment.CenterVertically,
+                        verticalAlignment     = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
@@ -128,7 +157,7 @@ fun AudioTranslationScreen(
                         )
                         IconButton(
                             onClick  = viewModel::speakTranslation,
-                            enabled  = state.ttsState.isReady &&
+                            enabled  = state.isTtsReady &&
                                     state.playbackState == PlaybackState.IDLE,
                         ) {
                             Icon(
@@ -140,11 +169,12 @@ fun AudioTranslationScreen(
                     }
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        text  = state.llmState.translatedText,
+                        text  = state.translatedText,
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                     )
-                    if (state.recordingState == RecordingState.PROCESSING || state.llmState.isTranslating) {
+                    // Show progress bar while the LLM is still streaming
+                    if (state.isTranslating || state.recordingState == RecordingState.PROCESSING) {
                         Spacer(Modifier.height(4.dp))
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     }
@@ -168,13 +198,10 @@ private fun RecordButton(
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val scale by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue  = 1.15f,
-        animationSpec = infiniteRepeatable(
-            animation  = tween(600),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "scale",
+        initialValue  = 1f,
+        targetValue   = 1.15f,
+        animationSpec = infiniteRepeatable(tween(600), RepeatMode.Reverse),
+        label         = "scale",
     )
 
     val isRecording = recordingState == RecordingState.RECORDING
@@ -184,21 +211,21 @@ private fun RecordButton(
         verticalAlignment     = Alignment.CenterVertically,
     ) {
         FloatingActionButton(
-            onClick = if (isRecording) onStop else onStart,
-            modifier = Modifier
+            onClick        = if (isRecording) onStop else onStart,
+            modifier       = Modifier
                 .size(72.dp)
                 .then(if (isRecording) Modifier.scale(scale) else Modifier),
-            shape            = CircleShape,
-            containerColor   = if (isRecording)
+            shape          = CircleShape,
+            containerColor = if (isRecording)
                 MaterialTheme.colorScheme.error
             else
                 MaterialTheme.colorScheme.primary,
-            contentColor     = Color.White,
+            contentColor   = Color.White,
         ) {
             Icon(
-                imageVector         = if (isRecording) Icons.Default.Stop else Icons.Default.Mic,
-                contentDescription  = if (isRecording) "Stop recording" else "Start recording",
-                modifier            = Modifier.size(32.dp),
+                imageVector        = if (isRecording) Icons.Default.Stop else Icons.Default.Mic,
+                contentDescription = if (isRecording) "Stop recording" else "Start recording",
+                modifier           = Modifier.size(32.dp),
             )
         }
 
@@ -212,7 +239,7 @@ private fun RecordButton(
     }
 
     Text(
-        text  = when (recordingState) {
+        text = when (recordingState) {
             RecordingState.IDLE       -> if (enabled) "Tap to speak" else "Loading…"
             RecordingState.RECORDING  -> "Recording — tap to stop"
             RecordingState.PROCESSING -> "Processing…"
@@ -230,20 +257,20 @@ private fun TranscriptCard(
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
+        colors   = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.secondaryContainer,
         ),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                label,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                text      = label,
+                style     = MaterialTheme.typography.labelMedium,
+                color     = MaterialTheme.colorScheme.onSecondaryContainer,
                 fontStyle = if (isLive) FontStyle.Italic else FontStyle.Normal,
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                text,
+                text  = text,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSecondaryContainer,
             )
@@ -260,7 +287,7 @@ private fun ErrorBanner(message: String) {
         ),
     ) {
         Text(
-            message,
+            text     = message,
             modifier = Modifier.padding(12.dp),
             color    = MaterialTheme.colorScheme.onErrorContainer,
             style    = MaterialTheme.typography.bodySmall,
@@ -280,7 +307,7 @@ private fun LanguagePairRow(
     Row(
         verticalAlignment     = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.fillMaxWidth(),
+        modifier              = Modifier.fillMaxWidth(),
     ) {
         LanguageDropdown(
             selected   = source,
@@ -288,9 +315,7 @@ private fun LanguagePairRow(
             onSelected = onSource,
             modifier   = Modifier.weight(1f),
         )
-
         TextButton(onClick = onSwap) { Text("⇄") }
-
         LanguageDropdown(
             selected   = target,
             label      = "To",
@@ -311,26 +336,27 @@ private fun LanguageDropdown(
     var expanded by remember { mutableStateOf(false) }
 
     ExposedDropdownMenuBox(
-        expanded        = expanded,
+        expanded         = expanded,
         onExpandedChange = { expanded = !expanded },
-        modifier        = modifier,
+        modifier         = modifier,
     ) {
         OutlinedTextField(
-            value           = selected.displayName,
-            onValueChange   = {},
-            readOnly        = true,
-            label           = { Text(label) },
-            trailingIcon    = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
-            modifier        = Modifier.menuAnchor().fillMaxWidth(),
+            value         = selected.displayName,
+            onValueChange = {},
+            readOnly      = true,
+            label         = { Text(label) },
+            trailingIcon  = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            modifier      = Modifier
+                .menuAnchor()
+                .fillMaxWidth(),
         )
         ExposedDropdownMenu(
-            expanded        = expanded,
+            expanded         = expanded,
             onDismissRequest = { expanded = false },
         ) {
-            // Updated to use the new Enum entries instead of LanguageRepository
             Language.entries.forEach { lang ->
                 DropdownMenuItem(
-                    text = { Text(lang.displayName) },
+                    text    = { Text(lang.displayName) },
                     onClick = {
                         onSelected(lang)
                         expanded = false

@@ -53,7 +53,7 @@ fun TextTranslationScreen(
         LanguageSelectorRow(
             sourceLanguage = state.sourceLanguage,
             targetLanguage = state.targetLanguage,
-            availableLanguages = Language.entries,
+            availableLanguages = state.availableLanguages,
             onSourceSelected = viewModel::setSourceLanguage,
             onTargetSelected = viewModel::setTargetLanguage,
             onSwap = viewModel::swapLanguages
@@ -72,20 +72,20 @@ fun TextTranslationScreen(
         // Translate button
         TranslateButton(
             canTranslate = state.canTranslate,
-            isTranslating = state.llmState.isTranslating,
+            isTranslating = state.isTranslating,
             onClick = viewModel::translate
         )
 
         // Result card
         AnimatedVisibility(
-            visible = state.llmState.translatedText.isNotBlank() || state.llmState.isTranslating || state.llmState.error != null,
+            visible = state.translatedText.isNotBlank() || state.isTranslating || state.translationError != null,
             enter = fadeIn() + expandVertically(),
             exit = fadeOut() + shrinkVertically()
         ) {
             ResultCard(
-                translatedText = state.llmState.translatedText,
-                isTranslating = state.llmState.isTranslating,
-                error = state.llmState.error,
+                translatedText = state.translatedText,
+                isTranslating = state.isTranslating,
+                error = state.translationError,
                 targetLanguage = state.targetLanguage,
                 onUseAsSource = viewModel::copyTranslationToSource
             )
@@ -101,8 +101,8 @@ fun TextTranslationScreen(
 
 @Composable
 private fun EngineStatusBanner(state: com.translator.ui.state.TranslationUiState) {
-    AnimatedVisibility(visible = !state.llmState.isEngineReady || state.llmState.error != null) {
-        val isError = state.llmState.error != null
+    AnimatedVisibility(visible = !state.isEngineReady || state.engineError != null) {
+        val isError = state.engineError != null
         Surface(
             shape = RoundedCornerShape(10.dp),
             color = if (isError) MaterialTheme.colorScheme.errorContainer
@@ -118,7 +118,7 @@ private fun EngineStatusBanner(state: com.translator.ui.state.TranslationUiState
                     Icon(Icons.Default.Warning, contentDescription = null,
                         tint = MaterialTheme.colorScheme.error)
                     Text(
-                        text = state.llmState.error ?: "Engine error",
+                        text = state.engineError ?: "Engine error",
                         color = MaterialTheme.colorScheme.onErrorContainer,
                         style = MaterialTheme.typography.bodySmall
                     )
@@ -287,7 +287,7 @@ private fun LanguagePickerDialog(
                                         fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                                     )
                                     Text(
-                                        lang.nativeName,
+                                        lang.code,
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )

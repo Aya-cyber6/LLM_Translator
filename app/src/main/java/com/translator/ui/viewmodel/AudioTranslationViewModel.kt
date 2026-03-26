@@ -1,9 +1,11 @@
 // AudioTranslationViewModel.kt
+
 package com.translator.ui.viewmodel
 
 import android.Manifest
 import android.app.Application
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -11,11 +13,19 @@ import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.SamplerConfig
-import com.translator.audio.AndroidSpeechTranscriber
-import com.translator.audio.TranscriptionSegment
+import com.google.mlkit.genai.common.DownloadStatus
+import com.google.mlkit.genai.common.FeatureStatus
+import com.google.mlkit.genai.common.audio.AudioSource
+import com.google.mlkit.genai.speechrecognition.SpeechRecognition
+import com.google.mlkit.genai.speechrecognition.SpeechRecognizer
+import com.google.mlkit.genai.speechrecognition.SpeechRecognizerOptions
+import com.google.mlkit.genai.speechrecognition.SpeechRecognizerResponse
+import com.google.mlkit.genai.speechrecognition.speechRecognizerOptions
+import com.google.mlkit.genai.speechrecognition.speechRecognizerRequest
 import com.translator.audio.TtsPlayer
 import com.translator.ui.state.AudioTranslationUiState
 import com.translator.ui.state.Language
+import com.translator.ui.state.ModelStatus
 import com.translator.ui.state.PlaybackState
 import com.translator.ui.state.RecordingState
 import kotlinx.coroutines.Dispatchers
@@ -29,52 +39,151 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.Locale
 
 class AudioTranslationViewModel(application: Application) : AndroidViewModel(application) {
-
-    // -------------------------------------------------------------------------
-    // UI State
-    // -------------------------------------------------------------------------
 
     private val _uiState = MutableStateFlow(AudioTranslationUiState())
     val uiState: StateFlow<AudioTranslationUiState> = _uiState.asStateFlow()
 
-    // -------------------------------------------------------------------------
-    // Dependencies
-    // -------------------------------------------------------------------------
-
     private var engine: Engine? = null
+    private var speechRecognizer: SpeechRecognizer? = null
     private val ttsPlayer = TtsPlayer(application)
-
-    // -------------------------------------------------------------------------
-    // Concurrent pipeline handles
-    // -------------------------------------------------------------------------
 
     private var transcriptionJob: Job? = null
     private var translationJob: Job? = null
-
-    /**
-     * Committed Whisper segments are sent here; the translation job drains it.
-     * UNLIMITED capacity so Whisper commits never block waiting for the LLM.
-     * Closed by stopRecording() to signal the translation job to finish.
-     */
     private var translationQueue: Channel<String> = Channel(Channel.UNLIMITED)
 
     // -------------------------------------------------------------------------
-    // Init
+    // Auto-init on ViewModel creation
+    // -------------------------------------------------------------------------
+
+    init {
+        // Kick off model check immediately — the UI starts in CHECKING and this
+        // is the only thing that moves it forward.
+        loadModel(Language.ENGLISH.locale)
+    }
+
+    // -------------------------------------------------------------------------
+    // Engine / TTS init
     // -------------------------------------------------------------------------
 
     fun attachEngine(sharedEngine: Engine) {
         engine = sharedEngine
-        _uiState.update {
-            it.copy(llmState = it.llmState.copy(isEngineReady = true, error = null))
+        _uiState.update { it.copy(isEngineReady = true, engineError = null) }
+    }
+
+    fun initTts() {
+        ttsPlayer.init { ready -> _uiState.update { it.copy(isTtsReady = ready) } }
+    }
+
+    // -------------------------------------------------------------------------
+    // ML Kit model — create, check status, download
+    // -------------------------------------------------------------------------
+
+    /**
+     * Creates a [SpeechRecognizer] for [locale] and checks whether the
+     * on-device model is ready. Called from [init] and on every source-language
+     * change.
+     *
+     * Two critical fixes vs the previous version:
+     *  1. MODE_BASIC instead of MODE_ADVANCED. ADVANCED is Pixel 10 only — on
+     *     every other device checkStatus() returns UNAVAILABLE immediately.
+     *  2. 10 s timeout around checkStatus(). AICore can block indefinitely right
+     *     after fresh device setup or an AICore data-clear, which would leave
+     *     modelStatus stuck on CHECKING forever.
+     */
+    fun loadModel(locale: Locale = Language.ENGLISH.locale) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(modelStatus = ModelStatus.CHECKING, modelError = null) }
+            try {
+                speechRecognizer?.close()
+                speechRecognizer = SpeechRecognition.getClient(
+                    speechRecognizerOptions {
+                        this.locale = locale
+                        // MODE_BASIC works on all API 31+ devices.
+                        // Switch to MODE_ADVANCED only if targeting Pixel 10 exclusively.
+                        this.preferredMode = SpeechRecognizerOptions.Mode.MODE_BASIC
+                    }
+                )
+
+                val status = withTimeoutOrNull(10_000L) {
+                    speechRecognizer?.checkStatus()
+                }
+
+                _uiState.update {
+                    when (status) {
+                        null ->
+                            it.copy(
+                                modelStatus = ModelStatus.UNAVAILABLE,
+                                modelError  = "Model check timed out — AICore may still be " +
+                                        "initialising. Wait a moment and try again.",
+                            )
+                        FeatureStatus.AVAILABLE    -> it.copy(modelStatus = ModelStatus.AVAILABLE)
+                        FeatureStatus.DOWNLOADABLE -> it.copy(modelStatus = ModelStatus.DOWNLOADABLE)
+                        FeatureStatus.DOWNLOADING  -> it.copy(modelStatus = ModelStatus.DOWNLOADING)
+                        FeatureStatus.UNAVAILABLE  ->
+                            it.copy(
+                                modelStatus = ModelStatus.UNAVAILABLE,
+                                modelError  = "Speech recognition not available on this device.",
+                            )
+                        else ->
+                            it.copy(
+                                modelStatus = ModelStatus.UNAVAILABLE,
+                                modelError  = "Unknown feature status: $status",
+                            )
+                    }
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        modelStatus = ModelStatus.UNAVAILABLE,
+                        modelError  = "Failed to initialise speech model: ${e.message}",
+                    )
+                }
+            }
         }
     }
 
-
-    fun initTts() {
-        ttsPlayer.init { ready ->
-            _uiState.update { it.copy(ttsState = it.ttsState.copy(isReady = ready)) }
+    /**
+     * Downloads the on-device model. Only meaningful when
+     * modelStatus == DOWNLOADABLE.
+     */
+    fun downloadModel() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(modelStatus = ModelStatus.DOWNLOADING, modelError = null) }
+            speechRecognizer?.download()
+                ?.catch { e ->
+                    _uiState.update {
+                        it.copy(
+                            modelStatus = ModelStatus.DOWNLOADABLE,
+                            modelError  = "Download failed: ${e.message}",
+                        )
+                    }
+                }
+                ?.collect { status ->
+                    when (status) {
+                        is DownloadStatus.DownloadStarted ->
+                            _uiState.update { it.copy(downloadProgress = "Starting download…") }
+                        is DownloadStatus.DownloadProgress -> {
+                            val mb = status.totalBytesDownloaded / (1024.0 * 1024.0)
+                            _uiState.update { it.copy(downloadProgress = "Downloading %.1f MB…".format(mb)) }
+                        }
+                        is DownloadStatus.DownloadCompleted ->
+                            _uiState.update {
+                                it.copy(modelStatus = ModelStatus.AVAILABLE, downloadProgress = null)
+                            }
+                        is DownloadStatus.DownloadFailed ->
+                            _uiState.update {
+                                it.copy(
+                                    modelStatus      = ModelStatus.DOWNLOADABLE,
+                                    downloadProgress = null,
+                                    modelError       = "Download failed: ${status.e.message}",
+                                )
+                            }
+                    }
+                }
         }
     }
 
@@ -84,84 +193,114 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
     fun startRecording() {
         if (!_uiState.value.canRecord) return
+
         if (ContextCompat.checkSelfPermission(
                 getApplication(), Manifest.permission.RECORD_AUDIO
             ) != PackageManager.PERMISSION_GRANTED
         ) {
+            _uiState.update { it.copy(recordingError = "Microphone permission not granted.") }
+            return
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             _uiState.update {
-                it.copy(asrState = it.asrState.copy(error = "Microphone permission not granted."))
+                it.copy(recordingError = "Live mic input requires Android 12 (API 31) or higher.")
             }
             return
         }
 
-        // Fresh channel for this session
         translationQueue = Channel(Channel.UNLIMITED)
 
         _uiState.update {
             it.copy(
-                recordingState = RecordingState.RECORDING,
-                asrState = it.asrState.copy(
-                    error = null,
-                    liveCaption = "",
-                    sourceTranscript = ""
-                ),
-                llmState = it.llmState.copy(
-                    error = null,
-                    isTranslating = false,
-                    translatedText = ""
-                )
+                recordingState     = RecordingState.RECORDING,
+                recordingError     = null,
+                liveCaption        = "",
+                sourceTranscript   = "",
+                translatedText     = "",
+                transcriptionError = null,
+                translationError   = null,
+                isTranslating      = false,
             )
         }
 
-        // ── Job 1: Transcription ──────────────────────────────────────────────
+        // ── Transcription job ─────────────────────────────────────────────────
         transcriptionJob = viewModelScope.launch {
-            // Grab the language code from your state (e.g., "en-US", "tr-TR")
-            val sourceLangCode = _uiState.value.sourceLanguage.code
+            val recognizer = speechRecognizer ?: run {
+                _uiState.update {
+                    it.copy(
+                        recordingState     = RecordingState.IDLE,
+                        transcriptionError = "Recognizer not ready. Call loadModel() first.",
+                    )
+                }
+                translationQueue.close()
+                return@launch
+            }
 
-            AndroidSpeechTranscriber(getApplication())
-                .start(sourceLangCode)
+            recognizer.startRecognition(
+                speechRecognizerRequest { audioSource = AudioSource.fromMic() }
+            )
                 .catch { e ->
                     _uiState.update {
                         it.copy(
-                            recordingState = RecordingState.IDLE,
-                            asrState = it.asrState.copy(error = "Transcription error: ${e.message}")
+                            recordingState     = RecordingState.IDLE,
+                            transcriptionError = "Recognition error: ${e.message}",
                         )
                     }
                     translationQueue.close()
                 }
-                .collect { segment ->
-                    when (segment) {
-                        is TranscriptionSegment.Partial -> {
-                            _uiState.update {
-                                it.copy(asrState = it.asrState.copy(liveCaption = segment.text))
-                            }
-                        }
-                        is TranscriptionSegment.Committed -> {
-                            val chunk = segment.text.trim()
+                .collect { response ->
+                    when (response) {
+                        is SpeechRecognizerResponse.PartialTextResponse ->
+                            _uiState.update { it.copy(liveCaption = response.text) }
+
+                        is SpeechRecognizerResponse.FinalTextResponse -> {
+                            val chunk = response.text.trim()
                             if (chunk.isNotBlank()) {
                                 _uiState.update {
-                                    val sep = if (it.asrState.sourceTranscript.isBlank()) "" else " "
+                                    val sep = if (it.sourceTranscript.isBlank()) "" else " "
                                     it.copy(
-                                        asrState = it.asrState.copy(
-                                            sourceTranscript = it.asrState.sourceTranscript + sep + chunk
-                                        )
+                                        sourceTranscript = it.sourceTranscript + sep + chunk,
+                                        liveCaption      = "",
                                     )
                                 }
                                 translationQueue.send(chunk)
                             }
                         }
-                        is TranscriptionSegment.Error -> {
-                            _uiState.update {
-                                it.copy(asrState = it.asrState.copy(error = segment.message))
+
+                        is SpeechRecognizerResponse.CompletedResponse -> {
+                            val lastPartial = _uiState.value.liveCaption.trim()
+                            if (lastPartial.isNotBlank()) {
+                                _uiState.update {
+                                    val sep = if (it.sourceTranscript.isBlank()) "" else " "
+                                    it.copy(
+                                        sourceTranscript = it.sourceTranscript + sep + lastPartial,
+                                        liveCaption      = "",
+                                    )
+                                }
+                                translationQueue.send(lastPartial)
                             }
+                            translationQueue.close()
+                            _uiState.update { it.copy(recordingState = RecordingState.PROCESSING) }
+                        }
+
+                        is SpeechRecognizerResponse.ErrorResponse -> {
+                            _uiState.update {
+                                it.copy(
+                                    recordingState     = RecordingState.IDLE,
+                                    liveCaption        = "",
+                                    transcriptionError = "Recognition failed (code ${response.e.errorCode}): ${response.e.message}",
+                                )
+                            }
+                            translationQueue.close()
                         }
                     }
                 }
         }
 
-        // ── Job 2: Translation ────────────────────────────────────────────────
+        // ── Translation job ───────────────────────────────────────────────────
         translationJob = viewModelScope.launch {
-            _uiState.update { it.copy(llmState = it.llmState.copy(isTranslating = true)) }
+            _uiState.update { it.copy(isTranslating = true) }
             try {
                 for (chunk in translationQueue) {
                     translateChunk(
@@ -170,21 +309,15 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                         target = _uiState.value.targetLanguage,
                     )
                 }
-            } catch (e: ClosedReceiveChannelException) {
-                // Normal shutdown path
+            } catch (_: ClosedReceiveChannelException) {
+                // Normal exit
             } catch (e: Exception) {
-                _uiState.update {
-                    it.copy(llmState = it.llmState.copy(error = e.message))
-                }
+                _uiState.update { it.copy(translationError = e.message) }
             } finally {
                 _uiState.update {
-                    it.copy(
-                        recordingState = RecordingState.IDLE,
-                        llmState = it.llmState.copy(isTranslating = false)
-                    )
+                    it.copy(isTranslating = false, recordingState = RecordingState.IDLE)
                 }
-
-                val finalText = _uiState.value.llmState.translatedText.trim()
+                val finalText = _uiState.value.translatedText.trim()
                 if (finalText.isNotBlank()) speakTranslation(finalText)
             }
         }
@@ -192,102 +325,21 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
     fun stopRecording() {
         if (!_uiState.value.canStopRecording) return
-
-        transcriptionJob?.cancel()
-        transcriptionJob = null
-
-        val lastPartial = _uiState.value.asrState.liveCaption.trim()
-        if (lastPartial.isNotBlank()) {
-            translationQueue.trySend(lastPartial)
-            _uiState.update {
-                val sep = if (it.asrState.sourceTranscript.isBlank()) "" else " "
-                it.copy(
-                    asrState = it.asrState.copy(
-                        sourceTranscript = it.asrState.sourceTranscript + sep + lastPartial,
-                        liveCaption = ""
-                    )
-                )
-            }
-        }
-
-        translationQueue.close()
-
-        _uiState.update { it.copy(recordingState = RecordingState.PROCESSING) }
+        viewModelScope.launch { speechRecognizer?.stopRecognition() }
     }
 
     fun cancelRecording() {
+        viewModelScope.launch { speechRecognizer?.stopRecognition() }
         transcriptionJob?.cancel()
-        transcriptionJob = null
         translationJob?.cancel()
-        translationJob = null
         translationQueue.close()
-
         _uiState.update {
             it.copy(
                 recordingState = RecordingState.IDLE,
-                asrState = it.asrState.copy(liveCaption = ""),
-                llmState = it.llmState.copy(isTranslating = false)
+                liveCaption    = "",
+                isTranslating  = false,
             )
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // LLM
-    // -------------------------------------------------------------------------
-
-    private suspend fun translateChunk(
-        text: String,
-        source: Language,
-        target: Language,
-    ) = withContext(Dispatchers.IO) {
-        val currentEngine = engine
-            ?: throw IllegalStateException("Engine not ready")
-
-        val config = ConversationConfig(
-            systemInstruction = Contents.of(
-                "You are a professional translation engine. " +
-                        "Translate from ${source.displayName} to ${target.displayName}. " +
-                        "Output only the translated text — no explanations, no alternatives.",
-            ),
-            samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 0.3),
-        )
-
-        currentEngine.createConversation(config).use { conversation ->
-            val needsSeparator = _uiState.value.llmState.translatedText.isNotBlank()
-            if (needsSeparator) {
-                _uiState.update {
-                    it.copy(llmState = it.llmState.copy(translatedText = it.llmState.translatedText + " "))
-                }
-            }
-
-            conversation.sendMessageAsync(text)
-                .catch { e -> throw Exception("Translation stream error: ${e.message}") }
-                .collect { token ->
-                    _uiState.update {
-                        it.copy(llmState = it.llmState.copy(translatedText = it.llmState.translatedText + token.toString()))
-                    }
-                }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // TTS
-    // -------------------------------------------------------------------------
-
-    fun speakTranslation(text: String = _uiState.value.llmState.translatedText) {
-        if (text.isBlank() || !_uiState.value.ttsState.isReady) return
-        _uiState.update { it.copy(playbackState = PlaybackState.PLAYING) }
-        ttsPlayer.speak(
-            text         = text,
-            languageCode = _uiState.value.targetLanguage.code,
-        ) {
-            _uiState.update { it.copy(playbackState = PlaybackState.IDLE) }
-        }
-    }
-
-    fun stopPlayback() {
-        ttsPlayer.stop()
-        _uiState.update { it.copy(playbackState = PlaybackState.IDLE) }
     }
 
     // -------------------------------------------------------------------------
@@ -301,6 +353,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
             else
                 it.copy(sourceLanguage = language)
         }
+        loadModel(language.locale)   // pass the full BCP-47 locale, not Locale(code)
     }
 
     fun setTargetLanguage(language: Language) {
@@ -313,9 +366,57 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun swapLanguages() {
+        val current = _uiState.value
         _uiState.update {
-            it.copy(sourceLanguage = it.targetLanguage, targetLanguage = it.sourceLanguage)
+            it.copy(sourceLanguage = current.targetLanguage, targetLanguage = current.sourceLanguage)
         }
+        loadModel(current.targetLanguage.locale)
+    }
+
+    // -------------------------------------------------------------------------
+    // LLM translation
+    // -------------------------------------------------------------------------
+
+    private suspend fun translateChunk(text: String, source: Language, target: Language) =
+        withContext(Dispatchers.IO) {
+            val currentEngine = engine ?: throw IllegalStateException("Engine not ready")
+
+            val config = ConversationConfig(
+                systemInstruction = Contents.of(
+                    "You are a professional translation engine. " +
+                            "Translate from ${source.displayName} to ${target.displayName}. " +
+                            "Output only the translated text — no explanations, no alternatives.",
+                ),
+                samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 0.3),
+            )
+
+            currentEngine.createConversation(config).use { conversation ->
+                if (_uiState.value.translatedText.isNotBlank()) {
+                    _uiState.update { it.copy(translatedText = it.translatedText + " ") }
+                }
+                conversation.sendMessageAsync(text)
+                    .catch { e -> throw Exception("Translation error: ${e.message}") }
+                    .collect { token ->
+                        _uiState.update { it.copy(translatedText = it.translatedText + token.toString()) }
+                    }
+            }
+        }
+
+    // -------------------------------------------------------------------------
+    // TTS
+    // -------------------------------------------------------------------------
+
+    fun speakTranslation(text: String = _uiState.value.translatedText) {
+        if (text.isBlank() || !_uiState.value.isTtsReady) return
+        _uiState.update { it.copy(playbackState = PlaybackState.PLAYING) }
+        ttsPlayer.speak(text = text, languageCode = _uiState.value.targetLanguage.code) {
+            _uiState.update { it.copy(playbackState = PlaybackState.IDLE) }
+        }
+    }
+
+    fun stopPlayback() {
+        ttsPlayer.stop()
+        _uiState.update { it.copy(playbackState = PlaybackState.IDLE) }
     }
 
     // -------------------------------------------------------------------------
@@ -327,6 +428,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         transcriptionJob?.cancel()
         translationJob?.cancel()
         translationQueue.close()
+        speechRecognizer?.close()
         ttsPlayer.shutdown()
     }
 }
