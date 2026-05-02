@@ -24,7 +24,6 @@ import kotlinx.coroutines.launch
 import java.io.File
 
 class MainActivity : ComponentActivity() {
-
     private val textViewModel: TranslationViewModel by viewModels()
     private val audioViewModel: AudioTranslationViewModel by viewModels()
     private val permissionLauncher = registerForActivityResult(
@@ -47,7 +46,6 @@ class MainActivity : ComponentActivity() {
     // -------------------------------------------------------------------------
     // Copy model asset once, init engine, share with audio VM
     // -------------------------------------------------------------------------
-
     private fun initModel() {
         lifecycleScope.launch(Dispatchers.IO) {
             val modelFile = File(filesDir, "Gemma3-1B-IT_multi-prefill-seq_q4_ekv4096.litertlm")

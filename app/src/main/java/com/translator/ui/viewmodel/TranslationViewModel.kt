@@ -201,7 +201,6 @@ class TranslationViewModel(application: Application) : AndroidViewModel(applicat
     // -------------------------------------------------------------------------
     // Cleanup
     // -------------------------------------------------------------------------
-
     override fun onCleared() {
         super.onCleared()
         translationJob?.cancel()

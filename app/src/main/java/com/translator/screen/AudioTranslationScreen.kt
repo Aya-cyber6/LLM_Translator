@@ -77,7 +77,7 @@ fun AudioTranslationScreen(
             }
             ModelStatus.DOWNLOADABLE -> {
                 OutlinedButton(
-                    onClick = viewModel::downloadModel,
+                    onClick = viewModel::downloadASRModel,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Icon(Icons.Default.Download, contentDescription = null)

@@ -1,5 +1,4 @@
 // AudioTranslationViewModel.kt
-
 package com.translator.ui.viewmodel
 
 import android.Manifest
@@ -47,7 +46,6 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
 
     private val _uiState = MutableStateFlow(AudioTranslationUiState())
     val uiState: StateFlow<AudioTranslationUiState> = _uiState.asStateFlow()
-
     private var engine: Engine? = null
     private var speechRecognizer: SpeechRecognizer? = null
     private val ttsPlayer = TtsPlayer(application)
@@ -56,18 +54,11 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
     private val perfLogger = PerformanceLogger()
     private var translationQueue: Channel<Pair<String, String>> = Channel(Channel.UNLIMITED)
     private var activeConversation: Conversation? = null
-    // -------------------------------------------------------------------------
-    // Auto-init on ViewModel creation
-    // -------------------------------------------------------------------------
 
     init {
-        loadModel(Language.ENGLISH.locale)
+        loadASRModel(Language.ENGLISH.locale)
         initTts()
     }
-
-    // -------------------------------------------------------------------------
-    // Engine / TTS init
-    // -------------------------------------------------------------------------
 
     fun attachEngine(sharedEngine: Engine) {
         engine = sharedEngine
@@ -78,23 +69,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         ttsPlayer.init { ready -> _uiState.update { it.copy(isTtsReady = ready) } }
     }
 
-    // -------------------------------------------------------------------------
-    // ML Kit model — create, check status, download
-    // -------------------------------------------------------------------------
-
-    /**
-     * Creates a [SpeechRecognizer] for [locale] and checks whether the
-     * on-device model is ready. Called from [init] and on every source-language
-     * change.
-     *
-     * Two critical fixes vs the previous version:
-     *  1. MODE_BASIC instead of MODE_ADVANCED. ADVANCED is Pixel 10 only — on
-     *     every other device checkStatus() returns UNAVAILABLE immediately.
-     *  2. 10 s timeout around checkStatus(). AICore can block indefinitely right
-     *     after fresh device setup or an AICore data-clear, which would leave
-     *     modelStatus stuck on CHECKING forever.
-     */
-    fun loadModel(locale: Locale = Language.ENGLISH.locale) {
+    fun loadASRModel(locale: Locale = Language.ENGLISH.locale) {
         viewModelScope.launch {
             _uiState.update { it.copy(modelStatus = ModelStatus.CHECKING, modelError = null) }
             try {
@@ -150,7 +125,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
      * Downloads the on-device model. Only meaningful when
      * modelStatus == DOWNLOADABLE.
      */
-    fun downloadModel() {
+    fun downloadASRModel() {
         viewModelScope.launch {
             _uiState.update { it.copy(modelStatus = ModelStatus.DOWNLOADING, modelError = null) }
             speechRecognizer?.download()
@@ -255,7 +230,6 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                             _uiState.update { it.copy(liveCaption = response.text) }
 
                         is SpeechRecognizerResponse.FinalTextResponse -> {
-
                             val chunk = response.text.trim()
                             val chunkId = UUID.randomUUID().toString()
                             perfLogger.startChunk(chunkId, chunk) // ⏱️ Start the ASR->TTS timer!
@@ -287,8 +261,8 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                                 }
                                 translationQueue.send(Pair(chunkId, lastPartial)) // Send the ID and text
                             }
-                            translationQueue.close()
                             _uiState.update { it.copy(recordingState = RecordingState.PROCESSING) }
+                            translationQueue.close()
                         }
 
                         is SpeechRecognizerResponse.ErrorResponse -> {
@@ -305,7 +279,6 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
                 }
         }
 
-        // ── Translation job ───────────────────────────────────────────────────
         // ── Translation job ───────────────────────────────────────────────────
         translationJob = viewModelScope.launch {
             _uiState.update { it.copy(isTranslating = true) }
@@ -396,7 +369,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
             else
                 it.copy(sourceLanguage = language)
         }
-        loadModel(language.locale)
+        loadASRModel(language.locale)
     }
 
     fun setTargetLanguage(language: Language) {
@@ -413,7 +386,7 @@ class AudioTranslationViewModel(application: Application) : AndroidViewModel(app
         _uiState.update {
             it.copy(sourceLanguage = current.targetLanguage, targetLanguage = current.sourceLanguage)
         }
-        loadModel(current.targetLanguage.locale)
+        loadASRModel(current.targetLanguage.locale)
     }
 
     // -------------------------------------------------------------------------
